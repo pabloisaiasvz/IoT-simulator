@@ -9,6 +9,9 @@ Mejoras sobre v1:
   ✓ Métricas globales y health check por heartbeat
   ✓ Config por .env (sin tocar el código)
   ✓ Autenticación usuario/contraseña y TLS opcional
+  ✓ Metadatos para medir latencia (seq, enviado_ts, reenviado_offline)
+  ✓ Fallas simuladas de dispositivos (quedan "mudos" → offline en el dashboard)
+  ✓ Last Will (LWT): si el proceso muere, el broker publica SIMULADOR_DESCONECTADO
 
 Instalación:
     pip install paho-mqtt python-dotenv
@@ -64,6 +67,12 @@ class Config:
     intervalo_s:       int   = int(os.getenv("INTERVALO_SEGUNDOS", "5"))
     cola_max:          int   = int(os.getenv("COLA_MAX", "500"))
 
+    # Fallas simuladas: probabilidad por ciclo y por casa de quedarse sin
+    # enviar datos durante FALLA_MIN_S–FALLA_MAX_S segundos (0 = desactivado)
+    prob_falla:        float = float(os.getenv("PROB_FALLA_DISPOSITIVO", "0.002"))
+    falla_min_s:       float = float(os.getenv("FALLA_MIN_S", "20"))
+    falla_max_s:       float = float(os.getenv("FALLA_MAX_S", "120"))
+
     # Umbrales de anomalías
     tension_min:       float = float(os.getenv("TENSION_MIN", "195"))
     tension_max:       float = float(os.getenv("TENSION_MAX", "245"))
@@ -75,6 +84,20 @@ class Config:
 
 
 CFG = Config()
+
+VERSION = "2.1"
+
+
+def iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def crear_cliente_mqtt(client_id: str) -> mqtt.Client:
+    """paho-mqtt 2.x exige callback_api_version; con VERSION1 los callbacks
+    mantienen la firma de 1.x, así el código funciona con ambas versiones."""
+    if hasattr(mqtt, "CallbackAPIVersion"):
+        return mqtt.Client(mqtt.CallbackAPIVersion.VERSION1, client_id=client_id, protocol=mqtt.MQTTv311)
+    return mqtt.Client(client_id=client_id, protocol=mqtt.MQTTv311)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -441,7 +464,20 @@ class GestorMQTT:
 
     def _construir_cliente(self):
         client_id = f"sim_iot_{random.randint(1000, 9999)}"
-        c = mqtt.Client(client_id=client_id, protocol=mqtt.MQTTv311)
+        c = crear_cliente_mqtt(client_id)
+
+        # Last Will: si el proceso muere sin desconectarse, el broker
+        # publica este mensaje (retained) para que el puente/dashboard lo sepan
+        c.will_set(
+            "iot/casas/status",
+            payload=json.dumps({
+                "evento":  "SIMULADOR_DESCONECTADO",
+                "motivo":  "last_will",
+                "version": VERSION,
+            }),
+            qos=1,
+            retain=True,
+        )
 
         if self.cfg.user:
             c.username_pw_set(self.cfg.user, self.cfg.password)
@@ -511,6 +547,7 @@ class GestorMQTT:
         if self.conectado.is_set():
             self._publicar_raw(msg)
         else:
+            msg["encolado"] = True
             try:
                 self.cola_offline.put_nowait(msg)
                 METRICAS.mensajes_en_cola = self.cola_offline.qsize()
@@ -519,7 +556,12 @@ class GestorMQTT:
                 log.debug("Cola offline llena, mensaje descartado")
 
     def _publicar_raw(self, msg: dict):
-        payload_str = json.dumps(msg["payload"], ensure_ascii=False)
+        # enviado_ts se estampa en el momento real del publish (no al generar
+        # la medición): la diferencia con "timestamp" es el tiempo en cola.
+        payload = {**msg["payload"], "enviado_ts": iso_now()}
+        if msg.get("encolado"):
+            payload["reenviado_offline"] = True
+        payload_str = json.dumps(payload, ensure_ascii=False)
         with self._lock:
             self._client.publish(
                 msg["topic"],
@@ -548,18 +590,64 @@ class GestorMQTT:
 
 
 # ══════════════════════════════════════════════════════════════
+# REGISTRO DE FALLAS SIMULADAS — qué casas están "mudas" ahora
+# ══════════════════════════════════════════════════════════════
+class RegistroFallas:
+    def __init__(self):
+        self._casas: set[str] = set()
+        self._lock = threading.Lock()
+
+    def marcar(self, casa_id: str, en_falla: bool):
+        with self._lock:
+            (self._casas.add if en_falla else self._casas.discard)(casa_id)
+
+    def lista(self) -> list[str]:
+        with self._lock:
+            return sorted(self._casas)
+
+
+FALLAS = RegistroFallas()
+
+
+# ══════════════════════════════════════════════════════════════
 # HILO SIMULADOR POR CASA
 # ══════════════════════════════════════════════════════════════
 class SimuladorCasa(threading.Thread):
     def __init__(self, casa_id: int, perfil: dict, gestor: GestorMQTT):
         super().__init__(name=f"Casa-{casa_id:02d}", daemon=True)
         self.casa_id  = casa_id
+        self.casa_key = f"CASA_{casa_id:02d}"
         self.perfil   = perfil
         self.gestor   = gestor
-        self.topic_t  = f"iot/casas/CASA_{casa_id:02d}/telemetria"
-        self.topic_a  = f"iot/casas/CASA_{casa_id:02d}/alertas"
+        self.topic_t  = f"iot/casas/{self.casa_key}/telemetria"
+        self.topic_a  = f"iot/casas/{self.casa_key}/alertas"
         # Estado previo para suavizado de consumo
         self._consumo_prev = float(perfil["base_w"])
+        # Número de secuencia: permite detectar mensajes perdidos en el puente
+        self._seq = 0
+        # Fin de la falla simulada en curso (0 = funcionando)
+        self._falla_hasta = 0.0
+
+    def _en_falla(self) -> bool:
+        """Decide si la casa está (o entra) en una falla simulada.
+        Durante la falla no se genera ni publica nada: para el resto del
+        sistema el dispositivo simplemente deja de reportar."""
+        ahora = time.time()
+        if self._falla_hasta:
+            if ahora < self._falla_hasta:
+                return True
+            self._falla_hasta = 0.0
+            FALLAS.marcar(self.casa_key, False)
+            log.info(f"[{self.name}] ✓ Dispositivo recuperado, vuelve a reportar")
+            return False
+
+        if CFG.prob_falla > 0 and random.random() < CFG.prob_falla:
+            duracion = random.uniform(CFG.falla_min_s, max(CFG.falla_min_s, CFG.falla_max_s))
+            self._falla_hasta = ahora + duracion
+            FALLAS.marcar(self.casa_key, True)
+            log.warning(f"[{self.name}] ✗ FALLA SIMULADA: sin reportar durante {duracion:.0f}s")
+            return True
+        return False
 
     def run(self):
         # Arranque escalonado: evita ráfaga inicial al broker
@@ -568,13 +656,23 @@ class SimuladorCasa(threading.Thread):
 
         while True:
             try:
-                # Tick de estado de red (solo un hilo lo hace, los demás leen)
+                # Tick de estado de red (solo un hilo lo hace, los demás leen).
+                # Va antes del chequeo de falla para que la red siga evolucionando
+                # aunque la casa 1 esté caída.
                 if self.casa_id == 1:
                     RED.tick()
+
+                if self._en_falla():
+                    time.sleep(CFG.intervalo_s)
+                    continue
 
                 medicion, self._consumo_prev = generar_medicion(
                     self.casa_id, self.perfil, self._consumo_prev
                 )
+                self._seq += 1
+                medicion["seq"]         = self._seq
+                medicion["intervalo_s"] = CFG.intervalo_s
+                medicion["version"]     = VERSION
 
                 # Publicar telemetría
                 self.gestor.publicar(self.topic_t, medicion, qos=1)
@@ -638,6 +736,8 @@ class HeartbeatThread(threading.Thread):
                     "evento_red": RED.evento_activo or None,
                     "cola_offline": snap["mensajes_en_cola"],
                     "uptime_s": snap["uptime_segundos"],
+                    "casas_en_falla": FALLAS.lista(),
+                    "version": VERSION,
                 }
                 self.gestor.publicar("iot/casas/status",   status,  qos=1, retain=True)
                 self.gestor.publicar("iot/casas/metricas", snap,    qos=0)
@@ -659,6 +759,8 @@ def main():
     log.info("  SIMULADOR IoT v2 — Sistema de Monitoreo Eléctrico")
     log.info(f"  {CFG.cantidad_casas} casas | Intervalo: {CFG.intervalo_s}s")
     log.info(f"  Broker: {CFG.host}:{CFG.port} | TLS: {CFG.tls}")
+    log.info(f"  Fallas simuladas: p={CFG.prob_falla} por ciclo "
+             f"({CFG.falla_min_s:.0f}–{CFG.falla_max_s:.0f}s)")
     log.info("═" * 62)
 
     # Cola offline compartida entre todos los hilos
@@ -679,7 +781,7 @@ def main():
         "timestamp":       datetime.now(timezone.utc).isoformat(),
         "casas_activas":   CFG.cantidad_casas,
         "intervalo_s":     CFG.intervalo_s,
-        "version":         "2.0",
+        "version":         VERSION,
     }, qos=1, retain=True)
 
     # Lanzar hilos de casas
